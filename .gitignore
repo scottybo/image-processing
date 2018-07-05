@@ -1,3 +1,4 @@
 .fly
 node_modules
 lib
+/nbproject/private/

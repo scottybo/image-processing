@@ -12,7 +12,7 @@ export interface ProcessOptions {
   detectWebp?: boolean
 }
 
-export function processImages(fetch: Fetch, opts?: ProcessOptions): Fetch {
+export function processImages(opts?: ProcessOptions): Fetch {
   if (!opts) {
     opts = {
       detectWebp: true
@@ -20,96 +20,105 @@ export function processImages(fetch: Fetch, opts?: ProcessOptions): Fetch {
   }
   // A fetch like function to handle image processing
   const processImagesFetch = async function processImages(req: RequestInfo, info?: RequestInit) {
-    if (typeof req === "string") {
-      req = new Request(req)
+      
+    try {
+        if (typeof req === "string") {
+          req = new Request(req)
+        }
+
+        const url = new URL(req.url.toString())
+        const params = buildOptions(req, url)
+        //console.info("params:", params)
+
+        const key = cacheKey(params.baseImage, params)
+        let resp = await respCache.get(key)
+
+        if (resp && params.cache == "true") {
+            resp.headers.set("Cache-Control", "public, max-age=2592000") // cache for 30 days
+            resp.headers.set("Cache", "HIT")
+          return resp
+        } // already done, cached, etc
+
+        req.headers.delete("accept-encoding") // make sure we don't get gzip
+
+        // this is a little hacky, but it caches the master with normal http caching
+        resp = await cache.match(req)
+        if (!resp) {
+          resp = await fetch(new Request(params.baseImage), info)
+          cache.put(req, resp.clone())
+        }
+
+        console.log("Watermark url:", params.watermark && params.watermark.url)
+        let wresp = params.watermark ? await fetch(new Request(params.watermark.url)) : null
+        let contentType = resp.headers.get("content-type") || ""
+        if (resp.status != 200 || !contentType.includes("image/")) {
+          // not an image, pass through
+          return resp
+        }
+        if (wresp) {
+          contentType = wresp.headers.get("content-type") || ""
+          if (wresp.status != 200 || !contentType.includes("image/")) {
+            // watermark not found
+            return new Response("watermark url not found (or not an image)", { status: 500 })
+          }
+        }
+
+        const body = await resp.arrayBuffer()
+        console.debug("body length:", body.byteLength)
+        let img = new fly.Image(body)
+
+        // this just applies the ops to the image without actually writing it out
+        img = await resize(img, params)
+
+        if (wresp && params.watermark) {
+          const wbody = await wresp.arrayBuffer()
+          const wmark = new fly.Image(wbody)
+          console.debug("watermark loaded:", wbody.byteLength)
+          const wm = await watermark(img, wmark, params)
+          img.overlayWith(wm, { gravity: params.watermark.position })
+          console.debug("watermark done")
+        }
+        if (params.format) {
+          const fn = img[params.format]
+          if (fn && typeof fn === "function") {
+            fn.apply(img)
+            resp.headers.set("content-type", `image/${params.format}`)
+          }
+        }
+
+        const result = await img.toBuffer()
+        const data = <ArrayBuffer>result.data
+        resp.headers.set("Content-Length", data.byteLength.toString())
+        resp.headers.set("Cache", "MISS")
+        resp.headers.set("Cache-Control", "public, max-age=2592000") // cache for 30 days
+        resp.headers.set("Cache-Key", key)
+        respCache.set(key, new Response(data, resp), 2592000)
+        return new Response(data, resp)
+    } catch (e) {
+        return new Response(e.stack, { status: 500 })
     }
-    const url = new URL(req.url)
-    const params = buildOptions(req, url)
-    console.debug("params:", params)
-
-    const key = cacheKey(url, params)
-    let resp = await respCache.get(key + "asdf")
-
-    if (resp) {
-      resp.headers.set("cache", "HIT")
-      return resp
-    } // already done, cached, etc
-
-    req.headers.delete("accept-encoding") // make sure we don't get gzip
-
-    // this is a little hacky, but it caches the master with normal http caching
-    resp = await cache.match(req)
-    if (!resp) {
-      resp = await fetch(req, info)
-
-      cache.put(req, resp.clone())
-    }
-    console.log("Watermark url:", params.watermark && params.watermark.url)
-    let wresp = params.watermark ? await fetch(new Request(params.watermark.url)) : null
-    let contentType = resp.headers.get("content-type") || ""
-    if (resp.status != 200 || !contentType.includes("image/")) {
-      // not an image, pass through
-      return resp
-    }
-    if (wresp) {
-      contentType = wresp.headers.get("content-type") || ""
-      if (wresp.status != 200 || !contentType.includes("image/")) {
-        // watermark not found
-        return new Response("watermark url not found (or not an image)", { status: 500 })
-      }
-    }
-
-    const body = await resp.arrayBuffer()
-    console.debug("body length:", body.byteLength)
-    let img = new fly.Image(body)
-
-    // this just applies the ops to the image without actually writing it out
-    img = await resize(img, params)
-
-    if (wresp && params.watermark) {
-      const wbody = await wresp.arrayBuffer()
-      const wmark = new fly.Image(wbody)
-      console.debug("watermark loaded:", wbody.byteLength)
-      const wm = await watermark(img, wmark, params)
-      img.overlayWith(wm, { gravity: params.watermark.position })
-      console.debug("watermark done")
-    }
-    if (params.format) {
-      const fn = img[params.format]
-      if (fn && typeof fn === "function") {
-        fn.apply(img)
-        resp.headers.set("content-type", `image/${params.format}`)
-      }
-    }
-
-    const result = await img.toBuffer()
-    const data = <ArrayBuffer>result.data
-    resp.headers.set("content-length", data.byteLength.toString())
-    resp.headers.set("cache", "MISS")
-    resp.headers.set("cache-key", key)
-    respCache.set(key, new Response(data, resp), 3600)
-    return new Response(data, resp)
   }
 
   const buildOptions = function buildOptions(req: Request, url?: URL): ImageOptions {
     if (!url) url = new URL(req.url)
     const params: ImageOptions = new (<any>defaultImageOptions.constructor)()
-    /*{
-      width: new Unit(url.searchParams.get("w")),
-        height: new Unit(url.searchParams.get("h")),
-          format: extractFormat(url.searchParams.get("format"))
-    }*/
+
     for (const p of urlParams) {
       const v = p.parser(url.searchParams.get(p.param))
       params[p.key] = v
     }
+    params['cache'] = "true"
+    params['baseImage'] = url.searchParams.get("i")
+    params['cache'] = url.searchParams.get("cache")
+    
+    if(typeof (params['cache']) == 'undefined' || params['cache'] == null || params['cache'] == '') {
+        params['cache'] = "true"
+    }
+    
     const w = url.searchParams.get("w_url")
     if (w) {
-      const wurl = new URL(req.url)
-      wurl.pathname = w
-      wurl.search = ""
       params.watermark = {
-        url: wurl.toString(),
+        url: w,
         width: defaultUnit,
         height: defaultUnit
       }
@@ -224,7 +233,7 @@ function scaleValue(u: Unit | undefined, v: number) {
   }
 }
 
-function cacheKey(url: URL, opts: ImageOptions) {
+function cacheKey(url: string, opts: ImageOptions) {
   let parts = [{ k: "_v", v: "1" }]
   for (const k of Object.keys(opts)) {
     const v = opts[k]
@@ -244,7 +253,7 @@ function cacheKey(url: URL, opts: ImageOptions) {
     }
   }
   parts = parts.sort()
-  return url.pathname +
+  return url +
     ":" + parts.map((p) => p.k).join("|") + // keys in plain english
     ":" + crypto.subtle.digestSync("sha-1", parts.map((p) => p.v).join("|"), "hex") // values as sha-1 hash
 }
